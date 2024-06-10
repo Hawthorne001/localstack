@@ -110,7 +110,7 @@ coverage==7.5.0
     # via localstack-core (pyproject.toml)
 crontab==1.0.1
     # via localstack-core
-cryptography==42.0.5
+cryptography==42.0.8
     # via
     #   joserfc
     #   localstack-core
@@ -189,7 +189,7 @@ itsdangerous==2.2.0
     # via
     #   flask
     #   quart
-jinja2==3.1.3
+jinja2==3.1.4
     # via
     #   flask
     #   moto-ext
@@ -384,7 +384,7 @@ referencing==0.31.1
     #   jsonschema-specifications
 regex==2024.4.28
     # via cfn-lint
-requests==2.31.0
+requests==2.32.0
     # via
     #   docker
     #   jsonschema-path
