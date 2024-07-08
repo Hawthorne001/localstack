@@ -86,7 +86,7 @@ cattrs==23.2.3
     # via jsii
 cbor2==5.6.3
     # via localstack-core
-certifi==2024.2.2
+certifi==2024.7.4
     # via
     #   httpcore
     #   httpx
