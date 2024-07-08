@@ -67,7 +67,7 @@ cachetools==5.3.3
     #   localstack-core (pyproject.toml)
 cbor2==5.6.3
     # via localstack-core
-certifi==2024.2.2
+certifi==2024.7.4
     # via
     #   opensearch-py
     #   requests
