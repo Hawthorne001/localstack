@@ -86,7 +86,7 @@ cattrs==23.2.3
     # via jsii
 cbor2==5.6.3
     # via localstack-core
-certifi==2024.2.2
+certifi==2024.7.4
     # via
     #   httpcore
     #   httpx
@@ -120,7 +120,7 @@ coveralls==4.0.0
     # via localstack-core
 crontab==1.0.1
     # via localstack-core
-cryptography==42.0.5
+cryptography==42.0.8
     # via
     #   joserfc
     #   localstack-core
@@ -209,7 +209,7 @@ itsdangerous==2.2.0
     # via
     #   flask
     #   quart
-jinja2==3.1.3
+jinja2==3.1.4
     # via
     #   flask
     #   moto-ext
@@ -612,7 +612,7 @@ referencing==0.31.1
     #   jsonschema-specifications
 regex==2024.4.28
     # via cfn-lint
-requests==2.31.0
+requests==2.32.2
     # via
     #   coveralls
     #   docker
@@ -834,3 +834,4 @@ zope-interface==6.3
 # The following packages are considered to be unsafe in a requirements file:
 # localstack-core
 # setuptools
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
