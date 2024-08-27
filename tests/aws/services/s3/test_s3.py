@@ -36,9 +36,6 @@ from localstack.config import LEGACY_V2_S3_PROVIDER, S3_VIRTUAL_HOSTNAME
 from localstack.constants import (
     AWS_REGION_US_EAST_1,
     LOCALHOST_HOSTNAME,
-    SECONDARY_TEST_AWS_ACCESS_KEY_ID,
-    SECONDARY_TEST_AWS_SECRET_ACCESS_KEY,
-    TEST_AWS_ACCESS_KEY_ID,
 )
 from localstack.services.s3 import constants as s3_constants
 from localstack.services.s3.utils import (
@@ -47,10 +44,16 @@ from localstack.services.s3.utils import (
     parse_expiration_header,
     rfc_1123_datetime,
 )
-from localstack.testing.aws.util import is_aws_cloud
+from localstack.testing.aws.util import in_default_partition, is_aws_cloud
+from localstack.testing.config import (
+    SECONDARY_TEST_AWS_ACCESS_KEY_ID,
+    SECONDARY_TEST_AWS_SECRET_ACCESS_KEY,
+    TEST_AWS_ACCESS_KEY_ID,
+)
 from localstack.testing.pytest import markers
 from localstack.testing.snapshots.transformer_utility import TransformerUtility
 from localstack.utils import testutil
+from localstack.utils.aws.arns import get_partition
 from localstack.utils.aws.request_context import mock_aws_request_headers
 from localstack.utils.aws.resources import create_s3_bucket
 from localstack.utils.files import load_file
@@ -665,6 +668,10 @@ class TestS3:
         snapshot.match("expected_error", e.value.response)
 
     @markers.aws.validated
+    @markers.snapshot.skip_snapshot_verify(
+        condition=is_v2_provider,
+        paths=["$.object-attrs-multiparts-2-parts-checksum.ObjectParts"],
+    )
     def test_get_object_attributes(self, s3_bucket, snapshot, s3_multipart_upload, aws_client):
         aws_client.s3.put_object(Bucket=s3_bucket, Key="data.txt", Body=b"69\n420\n")
         response = aws_client.s3.get_object_attributes(
@@ -692,6 +699,56 @@ class TestS3:
             MaxParts=3,
         )
         snapshot.match("object-attrs-multiparts-2-parts", response)
+
+        multipart_key = "test-get-obj-attrs-multipart-2"
+        s3_multipart_upload(bucket=s3_bucket, key=multipart_key, data="upload-part-1" * 5, parts=2)
+        response = aws_client.s3.get_object_attributes(
+            Bucket=s3_bucket,
+            Key=multipart_key,
+            ObjectAttributes=["StorageClass", "ETag", "ObjectSize", "Checksum"],
+            MaxParts=3,
+        )
+        snapshot.match("object-attrs-multiparts-2-parts-checksum", response)
+
+    @markers.aws.validated
+    def test_get_object_attributes_with_space(
+        self, s3_bucket, aws_client, aws_http_client_factory, snapshot
+    ):
+        """
+        It seems AWS SDKs are aligning themselves and are now putting whitespace between comas in headers list
+        See https://github.com/aws/aws-sdk-ruby/issues/3032
+        https://www.rfc-editor.org/rfc/rfc9110.html#name-lists-rule-abnf-extension
+        """
+        object_key = "test-attrs"
+        aws_client.s3.put_object(
+            Bucket=s3_bucket, Key=object_key, Body="test-body", ChecksumAlgorithm="SHA256"
+        )
+
+        s3_http_client = aws_http_client_factory("s3", signer_factory=SigV4Auth)
+        bucket_url = _bucket_url(s3_bucket)
+
+        get_object_attrs_url = f"{bucket_url}/{object_key}?attributes"
+        get_obj_attrs_resp = s3_http_client.get(
+            get_object_attrs_url,
+            headers={
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+                "x-amz-object-attributes": "ETag, Checksum, ObjectParts, StorageClass, ObjectSize",
+            },
+        )
+        assert get_obj_attrs_resp.ok
+        body = xmltodict.parse(get_obj_attrs_resp.content)
+        snapshot.match("get-attrs-with-whitespace", body)
+
+        get_obj_attrs_resp = s3_http_client.get(
+            get_object_attrs_url,
+            headers={
+                "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+                "x-amz-object-attributes": "ETag,Checksum,ObjectParts,StorageClass,ObjectSize",
+            },
+        )
+        assert get_obj_attrs_resp.ok
+        body = xmltodict.parse(get_obj_attrs_resp.content)
+        snapshot.match("get-attrs-without-whitespace", body)
 
     @markers.aws.validated
     @markers.snapshot.skip_snapshot_verify(
@@ -804,6 +861,16 @@ class TestS3:
         list_multipart_uploads = aws_client.s3.list_multipart_uploads(Bucket=s3_bucket)
         snapshot.match("list-all-uploads-completed", list_multipart_uploads)
 
+        head_object = aws_client.s3.head_object(
+            Bucket=s3_bucket, Key=key_name, ChecksumMode="ENABLED"
+        )
+        snapshot.match("head-multipart-checksum", head_object)
+
+        get_object = aws_client.s3.get_object(
+            Bucket=s3_bucket, Key=key_name, ChecksumMode="ENABLED"
+        )
+        snapshot.match("get-multipart-checksum", get_object)
+
     @markers.aws.validated
     def test_multipart_no_such_upload(self, s3_bucket, snapshot, aws_client):
         fake_upload_id = "fakeid"
@@ -832,7 +899,6 @@ class TestS3:
         snapshot.match("abort-exc", e.value.response)
 
     @pytest.mark.skipif(condition=LEGACY_V2_S3_PROVIDER, reason="not implemented in moto")
-    @markers.snapshot.skip_snapshot_verify(paths=["$..ServerSideEncryption"])
     @markers.aws.validated
     def test_multipart_complete_multipart_too_small(self, s3_bucket, snapshot, aws_client):
         key_name = "test-upload-part-exc"
@@ -935,20 +1001,28 @@ class TestS3:
         snapshot.match("exc", e.value.response)
 
     @markers.aws.validated
-    def test_create_bucket_via_host_name(self, s3_vhost_client, aws_client):
+    def test_create_bucket_via_host_name(self, s3_vhost_client, aws_client, region_name):
         # TODO check redirection (happens in AWS because of region name), should it happen in LS?
         # https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#VirtualHostingBackwardsCompatibility
         bucket_name = f"test-{short_uid()}"
         try:
             response = s3_vhost_client.create_bucket(
                 Bucket=bucket_name,
-                CreateBucketConfiguration={"LocationConstraint": "eu-central-1"},
+                CreateBucketConfiguration={
+                    "LocationConstraint": region_name
+                    if region_name != "us-east-1"
+                    else "eu-central-1"
+                },
             )
             assert "Location" in response
             assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
             response = s3_vhost_client.get_bucket_location(Bucket=bucket_name)
             assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
-            assert response["LocationConstraint"] == "eu-central-1"
+            assert (
+                response["LocationConstraint"] == region_name
+                if region_name != "us-east-1"
+                else "eu-central-1"
+            )
         finally:
             s3_vhost_client.delete_bucket(Bucket=bucket_name)
 
@@ -1042,6 +1116,13 @@ class TestS3:
         condition=is_v2_provider,
         paths=["$..ServerSideEncryption"],
     )
+    @markers.snapshot.skip_snapshot_verify(
+        # https://github.com/aws/aws-sdk/issues/498
+        # https://github.com/boto/boto3/issues/3568
+        # This issue seems to only happen when the ContentEncoding is internally set to `aws-chunked`. Because we
+        # don't use HTTPS when testing, the issue does not happen, so we skip the flag
+        paths=["$..ContentEncoding"],
+    )
     def test_put_object_checksum(self, s3_create_bucket, algorithm, snapshot, aws_client):
         bucket = s3_create_bucket()
         key = f"file-{short_uid()}"
@@ -1111,6 +1192,13 @@ class TestS3:
     @markers.snapshot.skip_snapshot_verify(
         condition=is_v2_provider,
         paths=["$..ServerSideEncryption"],
+    )
+    @markers.snapshot.skip_snapshot_verify(
+        # https://github.com/aws/aws-sdk/issues/498
+        # https://github.com/boto/boto3/issues/3568
+        # This issue seems to only happen when the ContentEncoding is internally set to `aws-chunked`. Because we
+        # don't use HTTPS when testing, the issue does not happen, so we skip the flag
+        paths=["$..ContentEncoding"],
     )
     def test_s3_get_object_checksum(self, s3_bucket, snapshot, algorithm, aws_client):
         key = "test-checksum-retrieval"
@@ -1185,6 +1273,123 @@ class TestS3:
             ObjectAttributes=["Checksum"],
         )
         snapshot.match("get-object-attrs", object_attrs)
+
+    @markers.aws.validated
+    @pytest.mark.skipif(
+        condition=LEGACY_V2_S3_PROVIDER, reason="Not implemented in legacy provider"
+    )
+    def test_s3_checksum_no_algorithm(self, s3_bucket, snapshot, aws_client):
+        key = f"file-{short_uid()}"
+        data = b"test data.."
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key,
+                Body=data,
+                ChecksumSHA256=short_uid(),
+            )
+        snapshot.match("put-wrong-checksum", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key,
+                Body=data,
+                ChecksumSHA256=short_uid(),
+                ChecksumCRC32=short_uid(),
+            )
+        snapshot.match("put-2-checksums", e.value.response)
+
+        resp = aws_client.s3.put_object(
+            Bucket=s3_bucket,
+            Key=key,
+            Body=data,
+            ChecksumSHA256=hash_sha256(data),
+        )
+        snapshot.match("put-right-checksum", resp)
+
+        head_obj = aws_client.s3.head_object(Bucket=s3_bucket, Key=key, ChecksumMode="ENABLED")
+        snapshot.match("head-obj", head_obj)
+
+    @markers.aws.validated
+    @pytest.mark.skipif(
+        condition=LEGACY_V2_S3_PROVIDER, reason="Not implemented in legacy provider"
+    )
+    @markers.snapshot.skip_snapshot_verify(
+        paths=[
+            "$.wrong-checksum.Error.HostId",  # FIXME: not returned in the exception
+        ]
+    )
+    def test_s3_checksum_no_automatic_sdk_calculation(
+        self, s3_bucket, snapshot, aws_client, aws_http_client_factory
+    ):
+        snapshot.add_transformer(
+            [
+                snapshot.transform.key_value("HostId"),
+                snapshot.transform.key_value("RequestId"),
+            ]
+        )
+        headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+        data = b"test data.."
+        hash_256_data = hash_sha256(data)
+
+        s3_http_client = aws_http_client_factory("s3", signer_factory=SigV4Auth)
+        bucket_url = _bucket_url(s3_bucket)
+
+        wrong_object_key = "wrong-checksum"
+        wrong_put_object_url = f"{bucket_url}/{wrong_object_key}"
+        wrong_put_object_headers = {**headers, "x-amz-checksum-sha256": short_uid()}
+        resp = s3_http_client.put(wrong_put_object_url, headers=wrong_put_object_headers, data=data)
+        resp_dict = xmltodict.parse(resp.content)
+        snapshot.match("wrong-checksum", resp_dict)
+
+        object_key = "right-checksum"
+        put_object_url = f"{bucket_url}/{object_key}"
+        put_object_headers = {**headers, "x-amz-checksum-sha256": hash_256_data}
+        resp = s3_http_client.put(put_object_url, headers=put_object_headers, data=data)
+        assert resp.ok
+
+        head_obj = aws_client.s3.head_object(
+            Bucket=s3_bucket, Key=object_key, ChecksumMode="ENABLED"
+        )
+        snapshot.match("head-obj-right-checksum", head_obj)
+
+        algo_object_key = "algo-only-checksum"
+        algo_put_object_url = f"{bucket_url}/{algo_object_key}"
+        algo_put_object_headers = {**headers, "x-amz-checksum-algorithm": "SHA256"}
+        resp = s3_http_client.put(algo_put_object_url, headers=algo_put_object_headers, data=data)
+        assert resp.ok
+
+        head_obj = aws_client.s3.head_object(
+            Bucket=s3_bucket, Key=algo_object_key, ChecksumMode="ENABLED"
+        )
+        snapshot.match("head-obj-only-checksum-algo", head_obj)
+
+        wrong_algo_object_key = "algo-wrong-checksum"
+        wrong_algo_put_object_url = f"{bucket_url}/{wrong_algo_object_key}"
+        wrong_algo_put_object_headers = {**headers, "x-amz-checksum-algorithm": "TEST"}
+        resp = s3_http_client.put(
+            wrong_algo_put_object_url, headers=wrong_algo_put_object_headers, data=data
+        )
+        assert resp.ok
+
+        algo_diff_object_key = "algo-diff-checksum"
+        algo_diff_put_object_url = f"{bucket_url}/{algo_diff_object_key}"
+        algo_diff_put_object_headers = {
+            **headers,
+            "x-amz-checksum-algorithm": "SHA1",
+            "x-amz-checksum-sha256": hash_256_data,
+        }
+        resp = s3_http_client.put(
+            algo_diff_put_object_url, headers=algo_diff_put_object_headers, data=data
+        )
+        assert resp.ok
+
+        head_obj = aws_client.s3.head_object(
+            Bucket=s3_bucket, Key=algo_diff_object_key, ChecksumMode="ENABLED"
+        )
+        snapshot.match("head-obj-diff-checksum-algo", head_obj)
 
     @markers.aws.validated
     @markers.snapshot.skip_snapshot_verify(
@@ -1292,6 +1497,109 @@ class TestS3:
 
         get_object_tags = aws_client.s3.get_object_tagging(Bucket=s3_bucket, Key=object_key_copy)
         snapshot.match("get-copy-object-tag", get_object_tags)
+
+        object_key_copy_tag_empty = f"{object_key}-copy-tag-empty"
+        resp = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key_copy_tag_empty,
+            **kwargs,
+        )
+        snapshot.match("copy-object-tag-empty", resp)
+
+        get_object_tags = aws_client.s3.get_object_tagging(
+            Bucket=s3_bucket, Key=object_key_copy_tag_empty
+        )
+        snapshot.match("get-copy-object-tag-empty", get_object_tags)
+
+    @markers.aws.validated
+    @markers.snapshot.skip_snapshot_verify(
+        condition=is_v2_provider,
+        paths=["$..ServerSideEncryption"],
+    )
+    @pytest.mark.parametrize("tagging_directive", ["COPY", "REPLACE", None])
+    def test_s3_copy_tagging_directive_versioned(
+        self, s3_bucket, snapshot, aws_client, tagging_directive
+    ):
+        snapshot.add_transformer(snapshot.transform.s3_api())
+        aws_client.s3.put_bucket_versioning(
+            Bucket=s3_bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
+        object_key = "source-object"
+        resp = aws_client.s3.put_object(
+            Bucket=s3_bucket, Key=object_key, Body="test", Tagging="key1=value1"
+        )
+        snapshot.match("put-object", resp)
+        version_1 = resp["VersionId"]
+
+        resp = aws_client.s3.put_object(
+            Bucket=s3_bucket, Key=object_key, Body="test-v2", Tagging="key1=value1-v2"
+        )
+        snapshot.match("put-object-v2", resp)
+
+        get_object_tags = aws_client.s3.get_object_tagging(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("get-object-tag", get_object_tags)
+
+        get_object_tags_v1 = aws_client.s3.get_object_tagging(
+            Bucket=s3_bucket, Key=object_key, VersionId=version_1
+        )
+        snapshot.match("get-object-tag-v1", get_object_tags_v1)
+
+        kwargs = {"TaggingDirective": tagging_directive} if tagging_directive else {}
+
+        object_key_copy = f"{object_key}-copy"
+        resp = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key_copy,
+            Tagging="key2=value2",
+            **kwargs,
+        )
+        snapshot.match("copy-object", resp)
+
+        get_object_tags = aws_client.s3.get_object_tagging(Bucket=s3_bucket, Key=object_key_copy)
+        snapshot.match("get-copy-object-tag", get_object_tags)
+
+        object_key_copy_tag_empty = f"{object_key}-copy-tag-empty"
+        resp = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key_copy_tag_empty,
+            **kwargs,
+        )
+        snapshot.match("copy-object-tag-empty", resp)
+
+        get_object_tags = aws_client.s3.get_object_tagging(
+            Bucket=s3_bucket, Key=object_key_copy_tag_empty
+        )
+        snapshot.match("get-copy-object-tag-empty", get_object_tags)
+
+        object_key_copy_v1 = f"{object_key}-copy-v1"
+        resp = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}?versionId={version_1}",
+            Key=object_key_copy_v1,
+            Tagging="key2=value2",
+            **kwargs,
+        )
+        snapshot.match("copy-object-v1", resp)
+
+        get_object_tags = aws_client.s3.get_object_tagging(Bucket=s3_bucket, Key=object_key_copy_v1)
+        snapshot.match("get-copy-object-tag-v1", get_object_tags)
+
+        object_key_copy_tag_empty_v1 = f"{object_key}-copy-tag-empty-v1"
+        resp = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}?versionId={version_1}",
+            Key=object_key_copy_tag_empty_v1,
+            **kwargs,
+        )
+        snapshot.match("copy-object-tag-empty-v1", resp)
+
+        get_object_tags = aws_client.s3.get_object_tagging(
+            Bucket=s3_bucket, Key=object_key_copy_tag_empty_v1
+        )
+        snapshot.match("get-copy-object-tag-empty-v1", get_object_tags)
 
     @markers.aws.validated
     @markers.snapshot.skip_snapshot_verify(
@@ -1465,12 +1773,121 @@ class TestS3:
             MetadataDirective="REPLACE",
         )
         snapshot.match("copy-in-place-versioned", copy_obj)
+        object_version_id = copy_obj["VersionId"]
 
         head_object = aws_client.s3.head_object(Bucket=s3_bucket, Key=object_key)
         snapshot.match("head-object-copied", head_object)
 
         get_obj = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
         snapshot.match("get-object-copied", get_obj)
+
+        aws_client.s3.put_bucket_versioning(
+            Bucket=s3_bucket, VersioningConfiguration={"Status": "Suspended"}
+        )
+
+        copy_obj = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key,
+            MetadataDirective="REPLACE",
+        )
+        snapshot.match("copy-in-place-versioned-suspended", copy_obj)
+        assert copy_obj["VersionId"] == "null"
+
+        head_object = aws_client.s3.head_object(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("head-object-copied-suspended", head_object)
+
+        get_obj = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("get-object-copied-suspended", get_obj)
+
+        head_object = aws_client.s3.head_object(
+            Bucket=s3_bucket, Key=object_key, VersionId=object_version_id
+        )
+        snapshot.match("head-object-previous-version-suspended", head_object)
+
+        # re-enable the bucket versioning, to copy from `null` to new version
+        aws_client.s3.put_bucket_versioning(
+            Bucket=s3_bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
+        copy_obj = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key,
+            MetadataDirective="REPLACE",
+        )
+        snapshot.match("copy-in-place-versioned-re-enabled", copy_obj)
+
+    @markers.aws.validated
+    @pytest.mark.skipif(
+        condition=LEGACY_V2_S3_PROVIDER,
+        reason="Behaviour is not in line with AWS, does not raise exception",
+    )
+    def test_s3_copy_object_in_place_suspended_only(
+        self, s3_bucket, allow_bucket_acl, snapshot, aws_client
+    ):
+        snapshot.add_transformer(snapshot.transform.s3_api())
+        snapshot.add_transformer(
+            [
+                snapshot.transform.key_value("DisplayName"),
+                snapshot.transform.key_value("ID", value_replacement="owner-id"),
+            ]
+        )
+        object_key = "source-object"
+
+        resp = aws_client.s3.put_object(
+            Bucket=s3_bucket,
+            Key=object_key,
+            Body='{"key": "value"}',
+            ContentType="application/json",
+            Metadata={"key": "value"},
+        )
+        snapshot.match("put_object", resp)
+
+        head_object = aws_client.s3.head_object(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("head_object", head_object)
+
+        copy_obj = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key,
+            MetadataDirective="REPLACE",
+        )
+        snapshot.match("copy-in-place-non-versioned", copy_obj)
+
+        head_object = aws_client.s3.head_object(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("head-object-copied", head_object)
+
+        get_obj = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("get-object-copied", get_obj)
+
+        aws_client.s3.put_bucket_versioning(
+            Bucket=s3_bucket, VersioningConfiguration={"Status": "Suspended"}
+        )
+
+        copy_obj = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key,
+            MetadataDirective="REPLACE",
+        )
+        snapshot.match("copy-in-place-versioned-suspended", copy_obj)
+        assert copy_obj["VersionId"] == "null"
+
+        head_object = aws_client.s3.head_object(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("head-object-copied-suspended", head_object)
+
+        get_obj = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
+        snapshot.match("get-object-copied-suspended", get_obj)
+
+        # this is to verify the CopySourceVersionId field, if returned if both objects got `null`
+        copy_obj_again = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            CopySource=f"{s3_bucket}/{object_key}",
+            Key=object_key,
+            MetadataDirective="REPLACE",
+        )
+        snapshot.match("copy-in-place-versioned-suspended-twice", copy_obj_again)
+        assert copy_obj_again["VersionId"] == "null"
 
     @markers.aws.validated
     @markers.snapshot.skip_snapshot_verify(
@@ -2823,7 +3240,9 @@ class TestS3:
         reason="Not implemented in other providers than stream",
         condition=LEGACY_V2_S3_PROVIDER,
     )
-    def test_put_object_chunked_newlines_with_checksum(self, s3_bucket, aws_client, region_name):
+    def test_put_object_chunked_newlines_with_trailing_checksum(
+        self, s3_bucket, aws_client, region_name
+    ):
         # Boto still does not support chunk encoding, which means we can't test with the client nor
         # aws_http_client_factory. See open issue: https://github.com/boto/boto3/issues/751
         # Test for https://github.com/localstack/localstack/issues/6659
@@ -2840,7 +3259,6 @@ class TestS3:
             "X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
             "X-Amz-Date": "20190918T051509Z",
             "X-Amz-Decoded-Content-Length": str(len(body)),
-            "x-amz-sdk-checksum-algorithm": "SHA256",
             "x-amz-trailer": "x-amz-checksum-sha256",
             "Content-Encoding": "aws-chunked",
         }
@@ -2869,6 +3287,60 @@ class TestS3:
         # put object with good checksum
         valid_data = get_data(body, valid_checksum)
         req = requests.put(url, valid_data, headers=headers, verify=False)
+        assert req.ok
+
+        # get object and assert content length
+        downloaded_object = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
+        download_file_object = to_str(downloaded_object["Body"].read())
+        assert len(body) == len(str(download_file_object))
+        assert body == str(download_file_object)
+
+    @markers.aws.only_localstack
+    @pytest.mark.skipif(
+        reason="Not implemented in other providers than stream",
+        condition=LEGACY_V2_S3_PROVIDER,
+    )
+    def test_put_object_chunked_checksum(self, s3_bucket, aws_client, region_name):
+        # Boto still does not support chunk encoding, which means we can't test with the client nor
+        # aws_http_client_factory. See open issue: https://github.com/boto/boto3/issues/751
+        # Test for https://github.com/localstack/localstack/issues/6659
+        object_key = "data"
+        body = "Hello Blob"
+        valid_checksum = hash_sha256(body)
+        headers = {
+            "Authorization": mock_aws_request_headers(
+                "s3",
+                aws_access_key_id=TEST_AWS_ACCESS_KEY_ID,
+                region_name=region_name,
+            )["Authorization"],
+            "Content-Type": "audio/mpeg",
+            "X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "X-Amz-Date": "20190918T051509Z",
+            "X-Amz-Decoded-Content-Length": str(len(body)),
+            "Content-Encoding": "aws-chunked",
+        }
+
+        data = (
+            "a;chunk-signature=b5311ac60a88890e740a41e74f3d3b03179fd058b1e24bb3ab224042377c4ec9\r\n"
+            f"{body}\r\n"
+            "0;chunk-signature=78fae1c533e34dbaf2b83ad64ff02e4b64b7bc681ea76b6acf84acf1c48a83cb\r\n"
+        )
+
+        url = f"{config.internal_service_url()}/{s3_bucket}/{object_key}"
+
+        # test with wrong checksum
+        headers["x-amz-checksum-sha256"] = "wrongchecksum"
+        request = requests.put(url, data, headers=headers, verify=False)
+        assert request.status_code == 400
+        assert "Value for x-amz-checksum-sha256 header is invalid." in request.text
+
+        # assert the object has not been created
+        with pytest.raises(ClientError):
+            aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
+
+        # put object with good checksum
+        headers["x-amz-checksum-sha256"] = valid_checksum
+        req = requests.put(url, data, headers=headers, verify=False)
         assert req.ok
 
         # get object and assert content length
@@ -3026,8 +3498,9 @@ class TestS3:
             "X-Amz-Date": "20190918T051509Z",
             "X-Amz-Decoded-Content-Length": str(len(body)),
             "Content-Encoding": "aws-chunked",
+            "X-Amz-Trailer": "x-amz-checksum-crc32",
         }
-        data = "23\r\n" f"{body}\r\n" "0\r\n" "x-amz-checksum-crc32:AKHICA==\r\n" "\r\n"
+        data = f"23\r\n{body}\r\n0\r\nx-amz-checksum-crc32:AKHICA==\r\n\r\n"
         # put object
         url = f"{config.internal_service_url()}/{s3_bucket}/{object_key}"
         requests.put(url, data, headers=headers, verify=False)
@@ -3036,6 +3509,34 @@ class TestS3:
         download_file_object = to_str(downloaded_object["Body"].read())
         assert len(body) == len(str(download_file_object))
         assert body == str(download_file_object)
+
+    @markers.aws.only_localstack
+    @pytest.mark.skipif(
+        reason="Not implemented in other providers than v3, moto fails at decoding",
+        condition=LEGACY_V2_S3_PROVIDER,
+    )
+    def test_put_object_chunked_newlines_no_sig_empty_body(
+        self, s3_bucket, aws_client, region_name
+    ):
+        object_key = "data"
+        headers = {
+            "Authorization": mock_aws_request_headers(
+                "s3", aws_access_key_id=TEST_AWS_ACCESS_KEY_ID, region_name=region_name
+            )["Authorization"],
+            "Content-Type": "audio/mpeg",
+            "X-Amz-Date": "20190918T051509Z",
+            "X-Amz-Decoded-Content-Length": "0",
+            "Content-Encoding": "aws-chunked",
+            "X-Amz-Trailer": "x-amz-checksum-crc32",
+        }
+        data = "0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n"
+        # put object
+        url = f"{config.internal_service_url()}/{s3_bucket}/{object_key}"
+        requests.put(url, data, headers=headers, verify=False)
+        # get object and assert content length
+        downloaded_object = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
+        download_file_object = to_str(downloaded_object["Body"].read())
+        assert len(str(download_file_object)) == 0
 
     @markers.aws.only_localstack
     def test_virtual_host_proxy_does_not_decode_gzip(self, aws_client, s3_bucket):
@@ -3402,7 +3903,7 @@ class TestS3:
             ),
             func_name=function_name,
             role=lambda_su_role,
-            runtime=Runtime.python3_9,
+            runtime=Runtime.python3_12,
             envvars={
                 "BUCKET_NAME": bucket_name,
                 "OBJECT_NAME": key,
@@ -4359,6 +4860,9 @@ class TestS3:
         assert len(proxied_response.headers["server"].split(",")) == 1
         assert len(proxied_response.headers["date"].split(",")) == 2  # coma in the date
 
+    @pytest.mark.skipif(
+        not in_default_partition(), reason="Test not applicable in non-default partitions"
+    )
     @pytest.mark.skipif(condition=TEST_S3_IMAGE, reason="KMS not enabled in S3 image")
     @markers.aws.validated
     def test_s3_sse_validate_kms_key(
@@ -4835,6 +5339,22 @@ class TestS3:
         key_name = "test-key"
         aws_client.s3.put_object(Bucket=s3_bucket, Key=key_name, Tagging="tag1=tag1")
 
+        # Lists all objects versions in a bucket
+        list_objects_version_url = f"{bucket_url}?versions"
+        resp = s3_http_client.get(list_objects_version_url, headers=headers)
+        assert b'<?xml version="1.0" encoding="UTF-8"?>\n' in get_xml_content(resp.content)
+        resp_dict = xmltodict.parse(resp.content)
+        assert "ListVersionsResult" in resp_dict
+        assert (
+            resp_dict["ListVersionsResult"]["@xmlns"] == "http://s3.amazonaws.com/doc/2006-03-01/"
+        )
+        # same as ListObjects
+        list_objects_versions_tags = list(resp_dict["ListVersionsResult"].keys())
+        assert list_objects_versions_tags.index("Name") < list_objects_versions_tags.index(
+            "Version"
+        )
+        assert list_objects_versions_tags[-1] == "Version"
+
         # GetObjectTagging
         get_object_tagging_url = f"{bucket_url}/{key_name}?tagging"
         resp = s3_http_client.get(get_object_tagging_url, headers=headers)
@@ -4972,7 +5492,10 @@ class TestS3:
         assert resp_dict["DeleteResult"]["Deleted"]["Key"] == object_key
 
     @markers.aws.validated
-    @pytest.mark.skipif(reason="Behaviour not implemented yet")
+    @pytest.mark.skipif(
+        condition=LEGACY_V2_S3_PROVIDER,
+        reason="Behaviour not implemented in moto",
+    )
     def test_complete_multipart_parts_checksum(self, s3_bucket, snapshot, aws_client):
         snapshot.add_transformer(
             [
@@ -5021,20 +5544,37 @@ class TestS3:
         response = aws_client.s3.list_parts(Bucket=s3_bucket, Key=key_name, UploadId=upload_id)
         snapshot.match("list-parts", response)
 
-        # testing completing the multipart without the checksum of parts
-        multipart_upload_parts_no_checksum = [
-            {"ETag": upload_part["ETag"], "PartNumber": upload_part["PartNumber"]}
-            for upload_part in multipart_upload_parts
-        ]
+        with pytest.raises(ClientError) as e:
+            # testing completing the multipart without the checksum of parts
+            multipart_upload_parts_wrong_checksum = [
+                {
+                    "ETag": upload_part["ETag"],
+                    "PartNumber": upload_part["PartNumber"],
+                    "ChecksumSHA256": hash_sha256("aaa"),
+                }
+                for upload_part in multipart_upload_parts
+            ]
+            aws_client.s3.complete_multipart_upload(
+                Bucket=s3_bucket,
+                Key=key_name,
+                MultipartUpload={"Parts": multipart_upload_parts_wrong_checksum},
+                UploadId=upload_id,
+            )
+        snapshot.match("complete-multipart-wrong-parts-checksum", e.value.response)
 
         with pytest.raises(ClientError) as e:
+            # testing completing the multipart without the checksum of parts
+            multipart_upload_parts_no_checksum = [
+                {"ETag": upload_part["ETag"], "PartNumber": upload_part["PartNumber"]}
+                for upload_part in multipart_upload_parts
+            ]
             aws_client.s3.complete_multipart_upload(
                 Bucket=s3_bucket,
                 Key=key_name,
                 MultipartUpload={"Parts": multipart_upload_parts_no_checksum},
                 UploadId=upload_id,
             )
-        snapshot.match("complete-multipart-without-checksum", e.value.response)
+        snapshot.match("complete-multipart-wrong-checksum", e.value.response)
 
         response = aws_client.s3.complete_multipart_upload(
             Bucket=s3_bucket,
@@ -5051,15 +5591,23 @@ class TestS3:
         get_object_with_checksum["Body"].read()
         snapshot.match("get-object-with-checksum", get_object_with_checksum)
 
+        head_object_with_checksum = aws_client.s3.head_object(
+            Bucket=s3_bucket, Key=key_name, ChecksumMode="ENABLED"
+        )
+        snapshot.match("head-object-with-checksum", head_object_with_checksum)
+
         object_attrs = aws_client.s3.get_object_attributes(
             Bucket=s3_bucket,
             Key=key_name,
-            ObjectAttributes=["Checksum"],
+            ObjectAttributes=["Checksum", "ETag"],
         )
         snapshot.match("get-object-attrs", object_attrs)
 
     @markers.aws.validated
-    @pytest.mark.xfail(reason="Behaviour not implemented yet")
+    @pytest.mark.skipif(
+        condition=LEGACY_V2_S3_PROVIDER,
+        reason="Behaviour not implemented in moto",
+    )
     def test_multipart_parts_checksum_exceptions(self, s3_bucket, snapshot, aws_client):
         snapshot.add_transformer(
             [
@@ -5072,32 +5620,47 @@ class TestS3:
         )
 
         key_name = "test-multipart-checksum-exc"
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.create_multipart_upload(
+                Bucket=s3_bucket, Key=key_name, ChecksumAlgorithm="TEST"
+            )
+        snapshot.match("create-mpu-wrong-checksum-algo", e.value.response)
+
         response = aws_client.s3.create_multipart_upload(Bucket=s3_bucket, Key=key_name)
         snapshot.match("create-mpu-no-checksum", response)
         upload_id = response["UploadId"]
 
         # data must be at least 5MiB
         part_data = "abc"
-        part_data = to_bytes(part_data)
-        checksum_part = hash_sha256(part_data)
+        checksum_part = hash_sha256(to_bytes(part_data))
 
-        # Write contents to memory rather than a file.
-        upload_file_object = BytesIO(part_data)
         with pytest.raises(ClientError) as e:
             aws_client.s3.upload_part(
                 Bucket=s3_bucket,
                 Key=key_name,
-                Body=upload_file_object,
+                Body=part_data,
                 PartNumber=1,
                 UploadId=upload_id,
                 ChecksumAlgorithm="SHA256",
             )
         snapshot.match("upload-part-with-checksum", e.value.response)
 
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.upload_part(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=part_data,
+                PartNumber=1,
+                UploadId=upload_id,
+                ChecksumSHA256=checksum_part,
+            )
+        snapshot.match("upload-part-with-checksum-calc", e.value.response)
+
         upload_resp = aws_client.s3.upload_part(
             Bucket=s3_bucket,
             Key=key_name,
-            Body=upload_file_object,
+            Body=part_data,
             PartNumber=1,
             UploadId=upload_id,
         )
@@ -5126,12 +5689,11 @@ class TestS3:
         snapshot.match("create-mpu-with-checksum", response)
         upload_id = response["UploadId"]
 
-        upload_file_object = BytesIO(part_data)
         with pytest.raises(ClientError) as e:
             aws_client.s3.upload_part(
                 Bucket=s3_bucket,
                 Key=key_name,
-                Body=upload_file_object,
+                Body=part_data,
                 PartNumber=1,
                 UploadId=upload_id,
             )
@@ -5554,7 +6116,7 @@ class TestS3:
         snapshot.match("if_match_err_1", e.value.response["Error"])
 
     @markers.aws.validated
-    def test_s3_inventory_report_crud(self, aws_client, s3_create_bucket, snapshot):
+    def test_s3_inventory_report_crud(self, aws_client, s3_create_bucket, snapshot, region_name):
         snapshot.add_transformer(snapshot.transform.resource_name())
         src_bucket = s3_create_bucket()
         dest_bucket = s3_create_bucket()
@@ -5567,7 +6129,7 @@ class TestS3:
                     "Effect": "Allow",
                     "Principal": {"Service": "s3.amazonaws.com"},
                     "Action": "s3:PutObject",
-                    "Resource": [f"arn:aws:s3:::{dest_bucket}/*"],
+                    "Resource": [f"arn:{get_partition(region_name)}:s3:::{dest_bucket}/*"],
                     "Condition": {
                         "ArnLike": {"aws:SourceArn": f"arn:aws:s3:::{src_bucket}"},
                     },
@@ -5580,7 +6142,7 @@ class TestS3:
             "Id": "test-inventory",
             "Destination": {
                 "S3BucketDestination": {
-                    "Bucket": f"arn:aws:s3:::{dest_bucket}",
+                    "Bucket": f"arn:{get_partition(region_name)}:s3:::{dest_bucket}",
                     "Format": "CSV",
                 }
             },
@@ -5695,7 +6257,9 @@ class TestS3:
         snapshot.match("wrong-optional-field", e.value.response)
 
     @markers.aws.validated
-    def test_put_bucket_inventory_config_order(self, aws_client, s3_create_bucket, snapshot):
+    def test_put_bucket_inventory_config_order(
+        self, aws_client, s3_create_bucket, snapshot, region_name
+    ):
         snapshot.add_transformer(snapshot.transform.resource_name())
         src_bucket = s3_create_bucket()
         dest_bucket = s3_create_bucket()
@@ -5705,7 +6269,7 @@ class TestS3:
                 "Id": config_id,
                 "Destination": {
                     "S3BucketDestination": {
-                        "Bucket": f"arn:aws:s3:::{dest_bucket}",
+                        "Bucket": f"arn:{get_partition(region_name)}:s3:::{dest_bucket}",
                         "Format": "CSV",
                     }
                 },
@@ -5831,7 +6395,7 @@ class TestS3MultiAccounts:
         """
         return secondary_aws_client.s3
 
-    @markers.aws.unknown
+    @markers.aws.only_localstack
     def test_shared_bucket_namespace(self, primary_client, secondary_client, cleanups):
         bucket_name = short_uid()
 
@@ -5843,7 +6407,7 @@ class TestS3MultiAccounts:
             create_s3_bucket(bucket_name=bucket_name, s3_client=secondary_client)
         exc.match("BucketAlreadyExists")
 
-    @markers.aws.unknown
+    @markers.aws.only_localstack
     def test_cross_account_access(
         self, primary_client, secondary_client, cleanups, s3_empty_bucket
     ):
@@ -5884,7 +6448,7 @@ class TestS3MultiAccounts:
         response = primary_client.get_object(Bucket=bucket_name, Key=key_name)
         assert response["Body"].read() == body2
 
-    @markers.aws.unknown
+    @markers.aws.only_localstack
     def test_cross_account_copy_object(
         self, primary_client, secondary_client, cleanups, s3_empty_bucket
     ):
@@ -6244,6 +6808,29 @@ class TestS3PresignedUrl:
         response = requests.get(url, data=b"get body is ignored by AWS")
         assert response.status_code == 200
         assert response.text == body
+
+    @markers.aws.validated
+    def test_presigned_double_encoded_credentials(
+        self, s3_bucket, aws_client, snapshot, presigned_snapshot_transformers
+    ):
+        key = "foo-key"
+        body = "foobar"
+
+        aws_client.s3.put_object(Bucket=s3_bucket, Key=key, Body=body)
+
+        presigned_client = _s3_client_pre_signed_client(
+            Config(signature_version="s3v4"),
+            endpoint_url=_endpoint_url(),
+        )
+        url = presigned_client.generate_presigned_url(
+            "get_object", Params={"Bucket": s3_bucket, "Key": key}
+        )
+        url = url.replace("%2F", "%252F")
+
+        response = requests.get(url)
+        assert response.status_code == 400
+        exception = xmltodict.parse(response.content)
+        snapshot.match("error-malformed", exception)
 
     @markers.aws.validated
     @pytest.mark.parametrize(
@@ -6675,6 +7262,8 @@ class TestS3PresignedUrl:
         account_id,
         wait_and_assume_role,
         patch_s3_skip_signature_validation_false,
+        region_name,
+        aws_client_factory,
     ):
         bucket_name = f"bucket-{short_uid()}"
         key_name = "key"
@@ -6708,6 +7297,7 @@ class TestS3PresignedUrl:
 
         client = boto3.client(
             "s3",
+            region_name=region_name,
             config=Config(signature_version="s3v4"),
             endpoint_url=_endpoint_url(),
             aws_access_key_id=credentials["AccessKeyId"],
@@ -6715,8 +7305,13 @@ class TestS3PresignedUrl:
             aws_session_token=credentials["SessionToken"],
         )
 
+        kwargs = (
+            {"CreateBucketConfiguration": {"LocationConstraint": region_name}}
+            if region_name != "us-east-1"
+            else {}
+        )
         retry(
-            lambda: s3_create_bucket_with_client(s3_client=client, Bucket=bucket_name),
+            lambda: s3_create_bucket_with_client(s3_client=client, Bucket=bucket_name, **kwargs),
             sleep=3 if is_aws_cloud() else 0.5,
         )
 
@@ -7159,6 +7754,7 @@ class TestS3PresignedUrl:
 
         function_name = f"func-integration-{short_uid()}"
         # we need the AWS SDK v2, and Node 16 still has it by default
+        # TODO since Node 16 is getting depricated we should consider ugrading to Node 20
         create_lambda_function(
             func_name=function_name,
             zip_file=testutil.create_zip_file(temp_folder, get_content=True),
@@ -9992,15 +10588,8 @@ class TestS3PresignedPost:
             allow_redirects=False,
         )
 
-    @staticmethod
-    def parse_response_xml(content: bytes) -> dict:
-        if not is_aws_cloud():
-            # AWS use double quotes in error messages and LocalStack uses single. Try to unify before snapshotting
-            content = content.replace(b"'", b'"')
-        return xmltodict.parse(content)
-
     @markers.aws.validated
-    @pytest.mark.xfail(
+    @pytest.mark.skip(
         reason="failing sporadically with new HTTP gateway (only in CI)",
     )
     def test_post_object_with_files(self, s3_bucket, aws_client):
@@ -10202,7 +10791,7 @@ class TestS3PresignedPost:
         snapshot.match("exception-no-sig-related-fields", exception)
 
     @markers.aws.validated
-    @pytest.mark.xfail(
+    @pytest.mark.skip(
         reason="sporadically failing in CI: presigned-post does not set the body, and then etag is wrong",
     )
     def test_s3_presigned_post_success_action_status_201_response(
@@ -10615,8 +11204,7 @@ class TestS3PresignedPost:
 
         # assert that it's rejected
         assert response.status_code == 403
-        resp_content = self.parse_response_xml(response.content)
-        snapshot.match("invalid-condition-eq", resp_content)
+        snapshot.match("invalid-condition-eq", xmltodict.parse(response.content))
 
         # PostObject with a wrong condition (missing $ prefix)
         presigned_request = aws_client.s3.generate_presigned_post(
@@ -10633,8 +11221,7 @@ class TestS3PresignedPost:
 
         # assert that it's rejected
         assert response.status_code == 403
-        resp_content = self.parse_response_xml(response.content)
-        snapshot.match("invalid-condition-missing-prefix", resp_content)
+        snapshot.match("invalid-condition-missing-prefix", xmltodict.parse(response.content))
 
         # PostObject with a wrong condition (multiple condition in one dict)
         presigned_request = aws_client.s3.generate_presigned_post(
@@ -10651,8 +11238,7 @@ class TestS3PresignedPost:
 
         # assert that it's rejected
         assert response.status_code == 400
-        resp_content = self.parse_response_xml(response.content)
-        snapshot.match("invalid-condition-wrong-condition", resp_content)
+        snapshot.match("invalid-condition-wrong-condition", xmltodict.parse(response.content))
 
         # PostObject with a wrong condition value casing
         presigned_request = aws_client.s3.generate_presigned_post(
@@ -10667,8 +11253,7 @@ class TestS3PresignedPost:
         response = self.post_generated_presigned_post_with_default_file(presigned_request)
         # assert that it's rejected
         assert response.status_code == 403
-        resp_content = self.parse_response_xml(response.content)
-        snapshot.match("invalid-condition-wrong-value-casing", resp_content)
+        snapshot.match("invalid-condition-wrong-value-casing", xmltodict.parse(response.content))
 
         object_expires = rfc_1123_datetime(
             datetime.datetime.now(ZoneInfo("GMT")) + datetime.timedelta(minutes=10)
@@ -10731,6 +11316,32 @@ class TestS3PresignedPost:
         final_object = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
         snapshot.match("final-object", final_object)
 
+        # test casing for x-amz-meta and specific Content-Type/Expires S3 headers, but without eq
+        presigned_request = aws_client.s3.generate_presigned_post(
+            Bucket=s3_bucket,
+            Key=object_key,
+            ExpiresIn=60,
+            Fields={
+                "x-amz-meta-test-1": "test-meta-1",
+                "x-amz-meta-TEST-2": "test-meta-2",
+                "Content-Type": "text/plain",
+                "Expires": object_expires,
+            },
+            Conditions=[
+                {"bucket": s3_bucket},
+                {"x-amz-meta-test-1": "test-meta-1"},
+                {"x-amz-meta-test-2": "test-meta-2"},
+                {"Content-Type": "text/plain"},
+                {"Expires": object_expires},
+            ],
+        )
+        # assert that it kept the casing
+        assert "x-amz-meta-TEST-2" in presigned_request["fields"]
+        assert "Content-Type" in presigned_request["fields"]
+        response = self.post_generated_presigned_post_with_default_file(presigned_request)
+        # assert that it's accepted
+        assert response.status_code == 204
+
     @pytest.mark.skipif(
         condition=LEGACY_V2_S3_PROVIDER,
         reason="not implemented in moto",
@@ -10774,8 +11385,7 @@ class TestS3PresignedPost:
 
         # assert that it's rejected
         assert response.status_code == 403
-        resp_content = self.parse_response_xml(response.content)
-        snapshot.match("invalid-condition-starts-with", resp_content)
+        snapshot.match("invalid-condition-starts-with", xmltodict.parse(response.content))
 
         # PostObject with a right redirect location start but wrong casing
         presigned_request["fields"]["success_action_redirect"] = "HTTP://localhost.test/random"
@@ -10783,8 +11393,7 @@ class TestS3PresignedPost:
 
         # assert that it's rejected
         assert response.status_code == 403
-        resp_content = self.parse_response_xml(response.content)
-        snapshot.match("invalid-condition-starts-with-casing", resp_content)
+        snapshot.match("invalid-condition-starts-with-casing", xmltodict.parse(response.content))
 
         # PostObject with a right redirect location start
         presigned_request["fields"]["success_action_redirect"] = redirect_location
@@ -10905,6 +11514,45 @@ class TestS3PresignedPost:
         final_object = aws_client.s3.get_object(Bucket=s3_bucket, Key=object_key)
         snapshot.match("final-object", final_object)
 
+        # try with string values for the content length range
+        presigned_request = aws_client.s3.generate_presigned_post(
+            Bucket=s3_bucket,
+            Key=object_key,
+            ExpiresIn=60,
+            Conditions=[
+                {"bucket": s3_bucket},
+                ["content-length-range", "5", "10"],
+            ],
+        )
+        # PostObject with a body length of 10
+        response = requests.post(
+            presigned_request["url"],
+            data=presigned_request["fields"],
+            files={"file": "a" * 10},
+            verify=False,
+        )
+        assert response.status_code == 204
+
+        # try with string values that are not cast-able for the content length range
+        presigned_request = aws_client.s3.generate_presigned_post(
+            Bucket=s3_bucket,
+            Key=object_key,
+            ExpiresIn=60,
+            Conditions=[
+                {"bucket": s3_bucket},
+                ["content-length-range", "test", "10"],
+            ],
+        )
+        # PostObject with a body length of 10
+        response = requests.post(
+            presigned_request["url"],
+            data=presigned_request["fields"],
+            files={"file": "a" * 10},
+            verify=False,
+        )
+        assert response.status_code == 403
+        snapshot.match("invalid-content-length-wrong-type", xmltodict.parse(response.content))
+
     @pytest.mark.skipif(
         condition=TEST_S3_IMAGE or LEGACY_V2_S3_PROVIDER,
         reason="STS not enabled in S3 image / moto does not implement this",
@@ -11016,6 +11664,582 @@ class TestS3PresignedPost:
 
         get_obj = aws_client.s3.get_object(Bucket=bucket_name, Key=object_key)
         snapshot.match("get-obj", get_obj)
+
+
+# LocalStack does not apply encryption, so the ETag is different
+@pytest.mark.skipif(condition=LEGACY_V2_S3_PROVIDER, reason="Not implemented")
+@markers.snapshot.skip_snapshot_verify(paths=["$..ETag"])
+class TestS3SSECEncryption:
+    # https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerSideEncryptionCustomerKeys.html
+    ENCRYPTION_KEY = b"1234567890abcdef1234567890abcdef"
+    ENCRYPTION_KEY_2 = b"abcdef1234567890abcdef1234567890"
+
+    @staticmethod
+    def get_encryption_key_b64_and_md5(encryption_key: bytes) -> tuple[str, str]:
+        sse_customer_key_base64 = base64.b64encode(encryption_key).decode("utf-8")
+        sse_customer_key_md5 = base64.b64encode(hashlib.md5(encryption_key).digest()).decode(
+            "utf-8"
+        )
+        return sse_customer_key_base64, sse_customer_key_md5
+
+    @markers.aws.validated
+    def test_put_object_lifecycle_with_sse_c(self, aws_client, s3_bucket, snapshot):
+        body = "test_data"
+        key_name = "test-sse-c"
+        cus_key, cus_key_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY)
+        put_obj = aws_client.s3.put_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            Body=body,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("put-obj-sse-c", put_obj)
+
+        head_obj = aws_client.s3.head_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("head-obj-sse-c", head_obj)
+
+        get_obj = aws_client.s3.get_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("get-obj-sse-c", get_obj)
+
+        get_obj_attr = aws_client.s3.get_object_attributes(
+            Bucket=s3_bucket,
+            Key=key_name,
+            ObjectAttributes=["ETag", "ObjectSize"],
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("get-obj-attrs-sse-c", get_obj_attr)
+
+        del_obj = aws_client.s3.delete_object(Bucket=s3_bucket, Key=key_name)
+        snapshot.match("del-obj-sse-c", del_obj)
+
+    @markers.aws.validated
+    def test_put_object_validation_sse_c(self, aws_client, s3_bucket, snapshot):
+        body = "test_data"
+        key_name = "test-sse-c"
+        cus_key, cus_key_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                ServerSideEncryption="AES256",
+                SSECustomerAlgorithm="KMS",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("put-obj-sse-c-both-encryption", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                SSECustomerAlgorithm="KMS",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("put-obj-sse-c-wrong-algo", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("put-obj-sse-c-no-algo", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("put-obj-sse-c-no-key", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+            )
+        snapshot.match("put-obj-sse-c-no-md5", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            bad_key_size = base64.b64encode(self.ENCRYPTION_KEY[:10]).decode("utf-8")
+            bad_key_size_md5 = base64.b64encode(
+                hashlib.md5(self.ENCRYPTION_KEY[:10]).digest()
+            ).decode("utf-8")
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=bad_key_size,
+                SSECustomerKeyMD5=bad_key_size_md5,
+            )
+        snapshot.match("put-obj-sse-c-wrong-key-size", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            bad_char = "a" if cus_key_md5[0] != "a" else "b"
+            bad_md5 = bad_char + cus_key_md5[1:]
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=bad_md5,
+            )
+        snapshot.match("put-obj-sse-c-bad-md5", e.value.response)
+
+    @markers.aws.validated
+    def test_object_retrieval_sse_c(self, aws_client, s3_bucket, snapshot):
+        body = "test_data"
+        key_name = "test-sse-c"
+        cus_key, cus_key_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY)
+        put_obj = aws_client.s3.put_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            Body=body,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("put-obj-sse-c", put_obj)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.get_object(Bucket=s3_bucket, Key=key_name)
+        snapshot.match("get-obj-no-sse-c", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            key_2, key_2_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY_2)
+            aws_client.s3.get_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=key_2,
+                SSECustomerKeyMD5=key_2_md5,
+            )
+        snapshot.match("get-obj-sse-c-wrong-key", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.get_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="KMS",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("get-obj-sse-c-wrong-algo", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.head_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="KMS",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("head-obj-sse-c-wrong-algo", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.get_object_attributes(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="KMS",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+                ObjectAttributes=["ETag"],
+            )
+        snapshot.match("get-obj-attrs-sse-c-wrong-algo", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.get_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+            )
+        snapshot.match("get-obj-sse-c-no-md5", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            bad_key_size = base64.b64encode(self.ENCRYPTION_KEY[:10]).decode("utf-8")
+            bad_key_size_md5 = base64.b64encode(
+                hashlib.md5(self.ENCRYPTION_KEY[:10]).digest()
+            ).decode("utf-8")
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=bad_key_size,
+                SSECustomerKeyMD5=bad_key_size_md5,
+            )
+        snapshot.match("get-obj-sse-c-wrong-key-size", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            bad_char = "a" if cus_key_md5[0] != "a" else "b"
+            bad_md5 = bad_char + cus_key_md5[1:]
+            aws_client.s3.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=bad_md5,
+            )
+        snapshot.match("get-obj-sse-c-bad-md5", e.value.response)
+
+    @markers.aws.validated
+    def test_copy_object_with_sse_c(self, aws_client, s3_bucket, snapshot):
+        body = "test_data"
+        key_name_src = "test-sse-c-src"
+        key_name_target = "test-sse-c-target"
+        cus_key, cus_key_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY)
+        put_obj = aws_client.s3.put_object(
+            Bucket=s3_bucket,
+            Key=key_name_src,
+            Body=body,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("put-obj-sse-c", put_obj)
+
+        # successful copy without encrypting the target
+        copy_obj = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            Key=key_name_target,
+            CopySource=f"{s3_bucket}/{key_name_src}",
+            CopySourceSSECustomerAlgorithm="AES256",
+            CopySourceSSECustomerKey=cus_key,
+            CopySourceSSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("copy-obj-sse-c-target-no-sse-c", copy_obj)
+
+        # successful copy while encrypting the target
+        copy_obj = aws_client.s3.copy_object(
+            Bucket=s3_bucket,
+            Key=key_name_target,
+            CopySource=f"{s3_bucket}/{key_name_src}",
+            CopySourceSSECustomerAlgorithm="AES256",
+            CopySourceSSECustomerKey=cus_key,
+            CopySourceSSECustomerKeyMD5=cus_key_md5,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("copy-obj-sse-c", copy_obj)
+
+        # assert the encryption is successful by trying to get object it without SSE-C
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.get_object(Bucket=s3_bucket, Key=key_name_target)
+        snapshot.match("get-obj-no-sse-c-param", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.copy_object(
+                Bucket=s3_bucket,
+                Key=key_name_target,
+                CopySource=f"{s3_bucket}/{key_name_src}",
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("copy-obj-no-src-sse-c", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.copy_object(
+                Bucket=s3_bucket,
+                Key=key_name_target,
+                CopySource=f"{s3_bucket}/{key_name_src}",
+                CopySourceSSECustomerAlgorithm="KMS",
+                CopySourceSSECustomerKey=cus_key,
+                CopySourceSSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("copy-obj-wrong-src-sse-c-algo", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.copy_object(
+                Bucket=s3_bucket,
+                Key=key_name_target,
+                CopySource=f"{s3_bucket}/{key_name_src}",
+                CopySourceSSECustomerAlgorithm="AES256",
+                CopySourceSSECustomerKey=cus_key,
+                CopySourceSSECustomerKeyMD5=cus_key_md5,
+                SSECustomerAlgorithm="KMS",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("copy-obj-wrong-target-sse-c-algo", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.copy_object(
+                Bucket=s3_bucket,
+                Key=key_name_target,
+                CopySource=f"{s3_bucket}/{key_name_src}",
+                CopySourceSSECustomerAlgorithm="AES256",
+                CopySourceSSECustomerKey=cus_key,
+                CopySourceSSECustomerKeyMD5=cus_key_md5,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+                ServerSideEncryption="AES256",
+            )
+        snapshot.match("copy-obj-target-double-encryption", e.value.response)
+
+    @markers.aws.validated
+    def test_multipart_upload_sse_c(self, aws_client, s3_bucket, snapshot):
+        snapshot.add_transformer(
+            [
+                snapshot.transform.key_value("Bucket", reference_replacement=False),
+                snapshot.transform.key_value("Location"),
+                snapshot.transform.key_value("UploadId"),
+                snapshot.transform.key_value("DisplayName", reference_replacement=False),
+                snapshot.transform.key_value("ID", reference_replacement=False),
+            ]
+        )
+        key_name = "test-sse-c-multipart"
+        cus_key, cus_key_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY)
+
+        response = aws_client.s3.create_multipart_upload(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("create-mpu-sse-c", response)
+        upload_id = response["UploadId"]
+
+        # data must be at least 5MiB
+        part_data = "a" * (5_242_880 + 1)
+        part_data = to_bytes(part_data)
+
+        parts = 3
+        multipart_upload_parts = []
+        for part in range(parts):
+            # Write contents to memory rather than a file.
+            part_number = part + 1
+            upload_file_object = BytesIO(part_data)
+            response = aws_client.s3.upload_part(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=upload_file_object,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+            snapshot.match(f"upload-part-{part}", response)
+            multipart_upload_parts.append(
+                {
+                    "ETag": response["ETag"],
+                    "PartNumber": part_number,
+                }
+            )
+
+        response = aws_client.s3.list_parts(Bucket=s3_bucket, Key=key_name, UploadId=upload_id)
+        snapshot.match("list-parts", response)
+
+        # no need to add the SSE-C on complete (from the documentation, but you still can?? weird?) TODO check
+        response = aws_client.s3.complete_multipart_upload(
+            Bucket=s3_bucket,
+            Key=key_name,
+            MultipartUpload={"Parts": multipart_upload_parts},
+            UploadId=upload_id,
+        )
+        snapshot.match("complete-multipart-checksum", response)
+
+        # assert the encryption is successful by trying to get object it without SSE-C
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.get_object(Bucket=s3_bucket, Key=key_name)
+        snapshot.match("get-obj-no-sse-c-param", e.value.response)
+
+        get_obj = aws_client.s3.get_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        # object is big, so we remove the body
+        get_obj["Body"].read()
+        snapshot.match("get-obj-sse-c", get_obj)
+
+    @markers.aws.validated
+    def test_multipart_upload_sse_c_validation(self, aws_client, s3_bucket, snapshot):
+        snapshot.add_transformer(
+            [
+                snapshot.transform.key_value("Bucket", reference_replacement=False),
+                snapshot.transform.key_value("Location"),
+                snapshot.transform.key_value("UploadId"),
+                snapshot.transform.key_value("DisplayName", reference_replacement=False),
+                snapshot.transform.key_value("ID", reference_replacement=False),
+            ]
+        )
+        body = "testbody"
+        key_name = "test-sse-c-multipart"
+        cus_key, cus_key_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY)
+
+        # create a multipart without SSE-C
+        response = aws_client.s3.create_multipart_upload(
+            Bucket=s3_bucket,
+            Key=key_name,
+        )
+        snapshot.match("create-mpu-no-sse-c", response)
+        upload_id = response["UploadId"]
+
+        # assert that if the multipart isnt created with SSE-C, you cannot upload with SSE-C
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.upload_part(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                PartNumber=1,
+                UploadId=upload_id,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key,
+                SSECustomerKeyMD5=cus_key_md5,
+            )
+        snapshot.match("mpu-no-sse-c-upload-part-with-sse-c", e.value.response)
+        # remove the multipart
+        aws_client.s3.abort_multipart_upload(Bucket=s3_bucket, Key=key_name, UploadId=upload_id)
+
+        # create a multipart with SSE-C
+        response = aws_client.s3.create_multipart_upload(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("create-mpu-sse-c", response)
+        upload_id = response["UploadId"]
+
+        # assert that if the multipart is created with SSE-C, you cannot upload without SSE-C
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.upload_part(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                PartNumber=1,
+                UploadId=upload_id,
+            )
+        snapshot.match("mpu-sse-c-upload-part-no-sse-c", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            key_2, key_2_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY_2)
+            aws_client.s3.upload_part(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=body,
+                PartNumber=1,
+                UploadId=upload_id,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=key_2,
+                SSECustomerKeyMD5=key_2_md5,
+            )
+        snapshot.match("mpu-sse-c-upload-part-wrong-sse-c", e.value.response)
+        # TODO: check complete with wrong parameters, even though it is not required to give them?
+
+    @markers.aws.validated
+    def test_sse_c_with_versioning(self, aws_client, s3_bucket, snapshot):
+        snapshot.add_transformer(snapshot.transform.key_value("VersionId"))
+        # enable versioning on the bucket
+        aws_client.s3.put_bucket_versioning(
+            Bucket=s3_bucket, VersioningConfiguration={"Status": "Enabled"}
+        )
+        # assert that you can use different encryption keys for different versions
+        key_name = "test-versioning-sse-c"
+        cus_key, cus_key_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY)
+        put_obj = aws_client.s3.put_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            Body="version1",
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+        )
+        snapshot.match("put-obj-sse-c-version-1", put_obj)
+        version_1 = put_obj["VersionId"]
+
+        cus_key_2, cus_key_2_md5 = self.get_encryption_key_b64_and_md5(self.ENCRYPTION_KEY_2)
+
+        put_obj_version_2 = aws_client.s3.put_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            Body="version2",
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key_2,
+            SSECustomerKeyMD5=cus_key_2_md5,
+        )
+        snapshot.match("put-obj-sse-c-version-2", put_obj_version_2)
+        version_2 = put_obj_version_2["VersionId"]
+
+        # last version should be what we call version-2, try getting it with Key 2
+        get_current_obj = aws_client.s3.get_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key_2,
+            SSECustomerKeyMD5=cus_key_2_md5,
+        )
+        snapshot.match("get-obj-sse-c-last-version", get_current_obj)
+
+        # access directly version 2
+        get_obj_2 = aws_client.s3.get_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key_2,
+            SSECustomerKeyMD5=cus_key_2_md5,
+            VersionId=version_2,
+        )
+        snapshot.match("get-obj-sse-c-version-2", get_obj_2)
+
+        # try getting the version 1 with Key 2
+        with pytest.raises(ClientError) as e:
+            aws_client.s3.get_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                SSECustomerAlgorithm="AES256",
+                SSECustomerKey=cus_key_2,
+                SSECustomerKeyMD5=cus_key_2_md5,
+                VersionId=version_1,
+            )
+        snapshot.match("get-obj-sse-c-last-version-wrong-key", e.value.response)
+
+        get_version_1_obj = aws_client.s3.get_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=cus_key,
+            SSECustomerKeyMD5=cus_key_md5,
+            VersionId=version_1,
+        )
+        snapshot.match("get-obj-sse-c-version-1", get_version_1_obj)
 
 
 def _s3_client_pre_signed_client(conf: Config, endpoint_url: str = None):

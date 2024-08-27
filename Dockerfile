@@ -1,5 +1,5 @@
 # java-builder: Stage to build a custom JRE (with jlink)
-FROM eclipse-temurin:11@sha256:abccfc31cefa4f3fad66630fceb51e59c7656a2ebfd1a831423dadaf684397fa as java-builder
+FROM eclipse-temurin:11@sha256:49b4274c068004fd73efb56fdb0f8890a6e17a7b2bdfa2be43341de9e1176d66 AS java-builder
 
 # create a custom, minimized JRE via jlink
 RUN jlink --add-modules \
@@ -29,7 +29,7 @@ jdk.localedata --include-locales en,th \
 
 
 # base: Stage which installs necessary runtime dependencies (OS packages, java,...)
-FROM python:3.11.9-slim-bookworm@sha256:6d2502238109c929569ae99355e28890c438cb11bc88ef02cd189c173b3db07c as base
+FROM python:3.11.9-slim-bookworm@sha256:ad5dadd957a398226996bc4846e522c39f2a77340b531b28aaab85b2d361210b AS base
 ARG TARGETARCH
 
 # Install runtime OS package dependencies
@@ -86,19 +86,20 @@ RUN ARCH= && dpkgArch="$(dpkg --print-architecture)" \
 SHELL [ "/bin/bash", "-c" ]
 
 # Install Java 11
-ENV LANG C.UTF-8
+ENV LANG=C.UTF-8
 RUN { \
         echo '#!/bin/sh'; echo 'set -e'; echo; \
         echo 'dirname "$(dirname "$(readlink -f "$(which javac || which java)")")"'; \
     } > /usr/local/bin/docker-java-home \
     && chmod +x /usr/local/bin/docker-java-home
-ENV JAVA_HOME /usr/lib/jvm/java-11
+ENV JAVA_HOME=/usr/lib/jvm/java-11
 COPY --from=java-builder /usr/lib/jvm/java-11 $JAVA_HOME
 RUN ln -s $JAVA_HOME/bin/java /usr/bin/java
-ENV PATH "${PATH}:${JAVA_HOME}/bin"
+ENV PATH="${PATH}:${JAVA_HOME}/bin"
 
 # set workdir
 RUN mkdir -p /opt/code/localstack
+RUN mkdir /opt/code/localstack/localstack-core
 WORKDIR /opt/code/localstack/
 
 # create localstack user and filesystem hierarchy, perform some permission fixes
@@ -138,7 +139,7 @@ RUN --mount=type=cache,target=/root/.cache \
 
 
 # builder: Stage which installs the dependencies of LocalStack Community
-FROM base as builder
+FROM base AS builder
 ARG TARGETARCH
 
 # Install build dependencies to base
@@ -171,12 +172,12 @@ FROM base
 COPY --from=builder /opt/code/localstack/.venv /opt/code/localstack/.venv
 
 # add project files necessary to install all dependencies
-ADD Makefile pyproject.toml VERSION ./
+ADD Makefile pyproject.toml VERSION setup.py ./
 # add the localstack start scripts (necessary for the installation of the runtime dependencies, i.e. `pip install -e .`)
 ADD bin/localstack bin/localstack.bat bin/localstack-supervisor bin/
 
 # add the code as late as possible
-ADD localstack/ localstack/
+ADD localstack-core/ /opt/code/localstack/localstack-core
 
 # Generate the plugin entrypoints
 RUN make entrypoints
@@ -200,7 +201,7 @@ RUN echo /usr/lib/localstack/python-packages/lib/python3.11/site-packages > loca
 # expose edge service, external service ports, and debugpy
 EXPOSE 4566 4510-4559 5678
 
-HEALTHCHECK --interval=10s --start-period=15s --retries=5 --timeout=5s CMD ./bin/localstack status services --format=json
+HEALTHCHECK --interval=10s --start-period=15s --retries=5 --timeout=5s CMD .venv/bin/localstack status services --format=json
 
 # default volume directory
 VOLUME /var/lib/localstack

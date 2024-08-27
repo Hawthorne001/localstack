@@ -32,6 +32,7 @@ from tests.aws.services.lambda_.test_lambda import (
     TEST_LAMBDA_PYTHON_ECHO,
     TEST_LAMBDA_PYTHON_S3_INTEGRATION,
 )
+from tests.aws.services.lambda_.utils import get_s3_keys
 
 # These performance tests are opt-in because we currently do not track performance systematically.
 if not is_env_true("TEST_PERFORMANCE"):
@@ -61,7 +62,7 @@ def test_invoke_warm_start(create_lambda_function, aws_client):
     create_lambda_function(
         handler_file=TEST_LAMBDA_PYTHON_ECHO,
         func_name=function_name,
-        runtime=Runtime.python3_9,
+        runtime=Runtime.python3_12,
     )
 
     def invoke():
@@ -85,7 +86,7 @@ def test_invoke_cold_start(create_lambda_function, aws_client, monkeypatch):
     create_lambda_function(
         handler_file=TEST_LAMBDA_PYTHON_ECHO,
         func_name=function_name,
-        runtime=Runtime.python3_9,
+        runtime=Runtime.python3_12,
     )
 
     def invoke():
@@ -688,16 +689,6 @@ def test_sns_subscription_lambda(
         num_invocations,
         num_invocations,
     ]
-
-
-def get_s3_keys(aws_client, s3_bucket) -> [str]:
-    s3_keys_output = []
-    paginator = aws_client.s3.get_paginator("list_objects_v2")
-    page_iterator = paginator.paginate(Bucket=s3_bucket)
-    for page in page_iterator:
-        for obj in page.get("Contents", []):
-            s3_keys_output.append(obj["Key"])
-    return s3_keys_output
 
 
 def format_summary(timings: [float]) -> str:

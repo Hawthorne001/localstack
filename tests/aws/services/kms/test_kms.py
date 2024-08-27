@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.serialization import load_der_public_key
 
 from localstack.services.kms.models import IV_LEN, Ciphertext, _serialize_ciphertext_blob
 from localstack.services.kms.utils import get_hash_algorithm
+from localstack.testing.aws.util import in_default_partition
 from localstack.testing.pytest import markers
 from localstack.utils.crypto import encrypt
 from localstack.utils.strings import short_uid, to_str
@@ -174,6 +175,9 @@ class TestKMS:
     def test_get_key_in_different_region(
         self, kms_client_for_region, kms_create_key, snapshot, region_name, secondary_region_name
     ):
+        snapshot.add_transformer(
+            snapshot.transform.regex(secondary_region_name, "<secondary-region>")
+        )
         client_region = region_name
         key_region = secondary_region_name
         us_east_1_kms_client = kms_client_for_region(client_region)
@@ -540,7 +544,7 @@ class TestKMS:
             )
         assert exc.match("ValidationException")
 
-    @markers.aws.unknown
+    @markers.aws.validated
     def test_invalid_key_usage(self, kms_create_key, aws_client):
         key_id = kms_create_key(KeyUsage="ENCRYPT_DECRYPT", KeySpec="RSA_4096")["KeyId"]
         with pytest.raises(ClientError) as exc:
@@ -568,7 +572,7 @@ class TestKMS:
             ("RSA_2048", "RSAES_OAEP_SHA_256"),
         ],
     )
-    @markers.aws.unknown
+    @markers.aws.validated
     def test_encrypt_decrypt(self, kms_create_key, key_spec, algo, aws_client):
         key_id = kms_create_key(KeyUsage="ENCRYPT_DECRYPT", KeySpec=key_spec)["KeyId"]
         message = b"test message 123 !%$@ 1234567890"
@@ -803,6 +807,9 @@ class TestKMS:
         assert not key["KeyId"].startswith("mrk-")
         snapshot.match("non_multi_region_keys_should_not_have_multi_region_properties", key)
 
+    @pytest.mark.skipif(
+        not in_default_partition(), reason="Test not applicable in non-default partitions"
+    )
     @markers.aws.validated
     @markers.snapshot.skip_snapshot_verify(
         paths=[
@@ -901,7 +908,7 @@ class TestKMS:
         assert alias is not None
         assert alias["TargetKeyId"] == new_key_id
 
-    @markers.aws.unknown
+    @markers.aws.validated
     def test_get_put_list_key_policies(self, kms_create_key, aws_client, account_id):
         base_policy = {
             "Version": "2012-10-17",
@@ -1282,7 +1289,8 @@ class TestKMS:
 
 
 class TestKMSMultiAccounts:
-    @markers.aws.unknown
+    @markers.aws.needs_fixing
+    # TODO: this test could not work against AWS, we need to assign proper permissions to the user/resources
     def test_cross_accounts_access(
         self, aws_client, secondary_aws_client, kms_create_key, user_arn
     ):
