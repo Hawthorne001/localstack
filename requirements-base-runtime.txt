@@ -40,7 +40,7 @@ click==8.1.7
     #   quart
 constantly==23.10.4
     # via localstack-twisted
-cryptography==42.0.5
+cryptography==43.0.1
     # via
     #   localstack-core (pyproject.toml)
     #   pyopenssl
